@@ -30,10 +30,13 @@ from .models import (
     SaveRecipeRequest,
     SolveRequest,
     SolveResult,
+    TankCorrectionRequest,
+    TankCorrectionResult,
     VersionSummary,
 )
 from .procurement import ProcurementError, build_procurement_plan
 from .solver import solve
+from .tank import TankCorrectionError, build_tank_correction
 
 
 @asynccontextmanager
@@ -382,6 +385,65 @@ def dispense_plan(
     except DispenseError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
     return DispensePlanResult(**plan)
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/tank-correction",
+    response_model=TankCorrectionResult,
+    tags=["recipes"],
+    summary="在缸复测纠偏：按实测浓度区间求追加浓缩液与清水量",
+)
+def tank_correction(
+    recipe_id: int, version: int, req: TankCorrectionRequest
+) -> TankCorrectionResult:
+    """缸内已有工作液复测后，按物料守恒求**只加版本内浓缩液与清水**的补液量。
+
+    - 读取指定配方版本的**目标浓度、容差与浓缩液成分**；请求提供缸内
+      **现有液量**、每个目标元素**实测浓度上下界**（点测可上下界相同）、
+      **目标终体积**与各浓缩液**可追加库存**。
+    - 变量为各浓缩液追加量 ``x_i``、清水量 ``w`` 与最坏偏差 ``t``，满足
+      体积等式 ``Σx_i + w = 终体积 - 现有液量``、``0 ≤ x_i ≤ 库存``；
+      每个目标元素的**两个实测区间端点**在终体积下都必须落入
+      ``目标量 × (1±t)``，最小化所有元素、所有端点的**最大相对偏差**
+      （连续线性规划，HiGHS，两阶段；最优偏差相同时取浓缩液追加总量最少）。
+      清水不含矿物质；现有液中某元素的质量 = 现有液量 × 实测浓度。
+    - 最优偏差超出版本容差时**仍返回最优补液量**（HTTP 200，
+      ``within_tolerance=false``），``elements[]`` 给出各元素两个端点
+      终浓度与最坏端点，``violations`` 列出超限项。
+    - 接口只读取版本数据，**绝不改写**配方版本。
+    - 配方/版本不存在返回 404；版本存在目标浓度为零的元素（相对偏差
+      无法定义）暂不接受；终体积小于现有液量、实测区间上下界颠倒、
+      实测元素或库存名称与版本不匹配（未知/缺失/重复）、负数或
+      NaN/Infinity 等均返回 422。
+    """
+    recipe = database.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(404, "配方不存在")
+    row = database.get_version(recipe_id, version)
+    if row is None:
+        raise HTTPException(404, "该版本不存在")
+
+    request_payload = json.loads(row["request_json"])
+    try:
+        correction = build_tank_correction(
+            recipe_id=recipe_id,
+            version=version,
+            request_payload=request_payload,
+            current_volume_ml=req.current_volume_ml,
+            target_final_volume_ml=req.target_final_volume_ml,
+            measurements=[
+                (
+                    m.element,
+                    m.measured_lower_mg_per_l,
+                    m.measured_upper_mg_per_l,
+                )
+                for m in req.measurements
+            ],
+            stock=[(s.concentrate, s.stock_ml) for s in req.stock],
+        )
+    except TankCorrectionError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return TankCorrectionResult(**correction)
 
 
 @app.get(

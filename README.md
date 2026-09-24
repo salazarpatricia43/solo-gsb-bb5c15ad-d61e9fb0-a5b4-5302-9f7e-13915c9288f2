@@ -52,6 +52,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions/{v}` | 读取某版本完整内容（请求 + 结果） |
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
 | POST | `/api/recipes/{id}/versions/{v}/dispense-plan` | **整数泵送投料方案**：按各浓缩液单次泵送量（mL）求整数泵次，最小化各元素最大相对偏差 |
+| POST | `/api/recipes/{id}/versions/{v}/tank-correction` | **在缸复测纠偏**：按缸内现有液量、各元素实测浓度上下界与目标终体积，只追加版本内浓缩液与清水，使所有实测区间端点在终体积的最大相对偏差最小 |
 | POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期（支持 `suspended_dates` 本地停灌日） |
 | POST | `/api/recipes/{id}/versions/{v}/procurement-plan` | **整包补货采购**：按灌溉批次求最低总价的整包采购组合（同价取总包数最少），无解时给出最早缺口批次 |
 | POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验/本地停灌日） |
@@ -849,14 +850,122 @@ curl -s -X POST \
 - **404**：配方不存在、或该配方下版本不存在。
 - **422**：库存或报价名称与版本不匹配（未知浓缩液 / 缺少某液 / 库存名称重复 / 库存为负）、`package_ml` 或 `price` 非正或非有限值（`0`、负数、`"1000"`、`NaN`、`Infinity`）、`max_packages` 为负或非整数、`arrival_date` 不是合法日期，以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、停灌日重复或超范围、多余字段）。注意：`quotes` 本身允许为空（库存够时无需采购）。
 
+## 在缸复测纠偏（POST /api/recipes/{id}/versions/{v}/tank-correction）
+
+缸中已有一批按某配方版本配制的工作液，复测发现浓度有偏差，需要**补液纠偏**到指定终体积。本接口读取该版本的**目标浓度、容差与浓缩液成分**，结合请求给出的：
+
+- 缸内**现有液量** `current_volume_ml`；
+- 每个目标元素的**实测浓度上下界** `measurements[]`（化验值是一个区间；点测可上下界填相同值）；
+- **目标终体积** `target_final_volume_ml`（不得小于现有液量）；
+- 每种版本浓缩液的**可追加库存** `stock[]`（可为 0，名称须与版本浓缩液一一对应）；
+
+只允许追加**该版本内的浓缩液**与**清水**（不含矿物质），按物料守恒用**连续线性规划**（HiGHS，两阶段）求补液量：
+
+- **体积等式**：`Σ 浓缩液追加量 + 清水量 = 目标终体积 − 现有液量`，`0 ≤ 各浓缩液追加量 ≤ 其库存`；
+- 缸内已有某元素的质量 = `现有液量 × 实测浓度`，追加浓缩液贡献 `浓度 × 追加量 ÷ 1000`，清水不带入任何元素；
+- 每个目标元素的**两个实测区间端点**在终体积下都必须落入 `目标量 × (1±t)`，最小化所有元素、所有端点的**最大相对偏差** `t`；
+- 最优偏差相同时，第二阶段取**浓缩液追加总量最少**的方案（清水补足剩余体积，省料且确定）。
+
+> 超出容差时接口**仍返回 200 与最优补液量**（`within_tolerance=false`），`elements[]` 给出各元素两个端点的终浓度、最坏端点（`worst_endpoint: lower/upper`）与带符号最坏偏差，`violations` 列出超限元素；接口只读取版本数据，**绝不改写配方版本**。存在目标浓度为零元素的版本（相对偏差无法定义）暂不接受，返回 422。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8000/api/recipes/1/versions/1/tank-correction \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "current_volume_ml": 9000,
+    "target_final_volume_ml": 10000,
+    "measurements": [
+      {"element": "N", "measured_lower_mg_per_l": 178, "measured_upper_mg_per_l": 182},
+      {"element": "P", "measured_lower_mg_per_l": 49,  "measured_upper_mg_per_l": 51},
+      {"element": "K", "measured_lower_mg_per_l": 84,  "measured_upper_mg_per_l": 86}
+    ],
+    "stock": [
+      {"concentrate": "A液", "stock_ml": 5000},
+      {"concentrate": "B液", "stock_ml": 5000}
+    ]
+  }'
+```
+
+该版本每 10 L 用 A 液 1500 mL、B 液 125 mL。若现有 9 L 正好在目标浓度上（点测 180/50/85），最优解就是把配方配比按 1 L 等比补入——**A 液 150 mL + B 液 12.5 mL + 清水 837.5 mL**，最大相对偏差为 0。上例带区间的响应（节选）：
+
+```json
+{
+  "recipe_id": 1,
+  "version": 1,
+  "within_tolerance": true,
+  "optimal": true,
+  "max_relative_deviation": 0.018,
+  "tolerance": 0.05,
+  "current_volume_ml": 9000.0,
+  "target_final_volume_ml": 10000.0,
+  "final_volume_ml": 10000.0,
+  "added_total_ml": 1000.0,
+  "water_add_ml": 849.5,
+  "concentrate_total_ml": 150.5,
+  "additions": [
+    {"concentrate": "A液", "add_volume_ml": 138.0, "stock_ml": 5000.0},
+    {"concentrate": "B液", "add_volume_ml": 12.5,  "stock_ml": 5000.0}
+  ],
+  "elements": [
+    {"element": "N", "target_concentration": 180.0,
+     "measured_lower_mg_per_l": 178.0, "measured_upper_mg_per_l": 182.0,
+     "final_lower_concentration": 176.76, "final_upper_concentration": 180.36,
+     "worst_endpoint": "lower", "worst_relative_deviation": -0.018,
+     "status": "ok"}
+  ],
+  "violations": [],
+  "message": "在缸复测纠偏求解成功：……"
+}
+```
+
+字段要点：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `additions[].add_volume_ml` | 每种版本浓缩液的建议追加量，恒满足 `≤ stock_ml` |
+| `water_add_ml` | 建议追加清水量 = 补液总量 − 浓缩液追加量合计 |
+| `final_volume_ml` | 实际终体积 = 现有液量 + 浓缩液追加量 + 清水量 |
+| `elements[].final_lower/upper_concentration` | 实测下界/上界端点按物料守恒推算到终体积后的浓度 (mg/L) |
+| `elements[].worst_endpoint` | 两上端点中相对目标偏差绝对值更大的一端（`lower` / `upper`） |
+| `elements[].worst_relative_deviation` | 最坏端点的带符号相对偏差（正=偏高，负=偏低） |
+| `max_relative_deviation` | 所有元素、两个端点中的最大相对偏差 |
+| `within_tolerance` | 该最优偏差是否 ≤ 版本 `tolerance`；**false 时方案与逐元素端点照常返回** |
+| `violations` | 超容差元素的 `ELEMENT_DEVIATION` 列表（含容差边界与最坏端点浓度） |
+
+库存不足（如 A 液库存为 0、实测 N 仅 100 mg/L）时无法补回目标，接口仍返回最优方案：此时只能全加清水 1000 mL，N 终浓度 90 mg/L（−50%），`within_tolerance=false`、`violations` 列出 N：
+
+```json
+{
+  "within_tolerance": false,
+  "max_relative_deviation": 0.5,
+  "water_add_ml": 1000.0,
+  "additions": [
+    {"concentrate": "A液", "add_volume_ml": 0.0, "stock_ml": 0.0},
+    {"concentrate": "B液", "add_volume_ml": 0.0, "stock_ml": 0.0}
+  ],
+  "violations": [
+    {"code": "ELEMENT_DEVIATION", "element": "N", "limit": 171.0, "actual": 90.0,
+     "message": "元素 N 实测下界端点在终体积下偏低：90.000 mg/L，目标 180.000 mg/L（容差 5%，容差边界 171.000 mg/L），相对偏差 -50.00%；……"}
+  ]
+}
+```
+
+错误码：
+
+- **404**：配方不存在、或该配方下版本不存在；
+- **422**：版本存在**目标浓度为零**的元素（暂不接受纠偏）、**目标终体积小于现有液量**、实测区间**上下界颠倒**、实测元素与版本目标不匹配（**未知 / 缺失 / 重复**、不支持的元素符号）、库存名称与版本浓缩液不匹配（**未知 / 缺失 / 重复**）、液量或库存为负 / 非有限值（`NaN`、`Infinity`）、多余字段。
+
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 灌溉计划 / 消耗预测）
+│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 在缸纠偏 / 灌溉计划 / 消耗预测）
 │   ├── solver.py     # minimax LP 建模与无可行解诊断
 │   ├── dispense.py    # 整数泵送方案：MILP（HiGHS）求整数泵次、最小化最大相对偏差
+│   ├── tank.py        # 在缸复测纠偏：区间端点 minimax LP（只加版本浓缩液与清水）
 │   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
 │   ├── forecast.py   # 库存消耗预测：按实际批次等比例扣减、缺口标记、逐日汇总
 │   ├── procurement.py # 整包补货采购：到货时点约束下的整数线性规划（最低总价/最少包数）

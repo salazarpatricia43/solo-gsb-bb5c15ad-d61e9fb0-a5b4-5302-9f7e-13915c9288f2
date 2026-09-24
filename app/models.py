@@ -914,3 +914,196 @@ class DispensePlanResult(BaseModel):
     elements: list[ElementResult]
     violations: list[Violation] = []
     message: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# In-tank re-measurement correction
+# --------------------------------------------------------------------------- #
+class ElementIntervalInput(BaseModel):
+    """Measured concentration uncertainty interval of one element (mg/L).
+
+    The lab reading is a range: the true in-tank concentration of the
+    element lies between ``measured_lower_mg_per_l`` and
+    ``measured_upper_mg_per_l`` (point readings pass the same value twice).
+    Both interval endpoints, once the tank is brought to the final volume,
+    must fit the minimax deviation band.
+    """
+
+    element: str = Field(
+        ..., min_length=1, description="目标元素名（大小写不敏感），如 N/P/K/Ca"
+    )
+    measured_lower_mg_per_l: float = Field(
+        ..., ge=0, description="实测浓度区间下界 (mg/L)，不能为负"
+    )
+    measured_upper_mg_per_l: float = Field(
+        ..., ge=0, description="实测浓度区间上界 (mg/L)，不能为负；不得小于下界"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("element")
+    @classmethod
+    def _normalize_element(cls, v: str) -> str:
+        elem = normalize_element(v)
+        if elem is None:
+            raise ValueError(
+                f"未知元素 '{v}'，支持: {', '.join(ELEMENTS)}"
+            )
+        return elem
+
+    @field_validator("measured_lower_mg_per_l", "measured_upper_mg_per_l")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        # ge=0 rejects negatives but NaN slips through comparisons.
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("实测浓度必须为有限非负数字")
+        return float(v)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "ElementIntervalInput":
+        if self.measured_lower_mg_per_l > self.measured_upper_mg_per_l:
+            raise ValueError(
+                f"元素 {self.element} 实测区间颠倒：下界 "
+                f"{self.measured_lower_mg_per_l:g} 大于上界 "
+                f"{self.measured_upper_mg_per_l:g}"
+            )
+        return self
+
+
+class TankCorrectionRequest(BaseModel):
+    """In-tank re-measurement correction inputs for one recipe version.
+
+    Only the version's own concentrates and clean (mineral-free) water may
+    be added on top of the liquid already in the tank.
+    """
+
+    current_volume_ml: float = Field(
+        ..., gt=0, description="缸内现有液量 (mL)，必须为正"
+    )
+    target_final_volume_ml: float = Field(
+        ..., gt=0, description="纠偏后的目标终体积 (mL)，不得小于现有液量"
+    )
+    measurements: list[ElementIntervalInput] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "各目标元素的实测浓度上下界 (mg/L)；必须与版本目标元素一一对应，"
+            "不可缺少、多余或重复"
+        ),
+    )
+    stock: list[StockLevel] = Field(
+        ...,
+        min_length=1,
+        description="各浓缩液当前可追加库存 (mL)；名称须与版本浓缩液一一对应",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("current_volume_ml", "target_final_volume_ml")
+    @classmethod
+    def _finite_volume(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("体积必须为有限正数")
+        return float(v)
+
+    @field_validator("measurements")
+    @classmethod
+    def _unique_measurements(cls, v: list[ElementIntervalInput]):
+        names = [m.element for m in v]
+        if len(names) != len(set(names)):
+            raise ValueError("实测元素不能重复")
+        return v
+
+    @model_validator(mode="after")
+    def _volume_order(self) -> "TankCorrectionRequest":
+        if self.target_final_volume_ml < self.current_volume_ml:
+            raise ValueError(
+                f"目标终体积 {self.target_final_volume_ml:g} mL 不能小于"
+                f"现有液量 {self.current_volume_ml:g} mL"
+            )
+        return self
+
+
+class TankAdditionResult(BaseModel):
+    """Planned add volume of one version concentrate."""
+
+    concentrate: str
+    add_volume_ml: float = Field(..., description="该浓缩液建议追加量 (mL)")
+    stock_ml: float = Field(
+        ..., description="请求中给出的该液可追加库存上限 (mL)"
+    )
+
+
+class TankCorrectionElementResult(BaseModel):
+    """Per-element worst endpoint after the correction additions."""
+
+    element: str
+    target_concentration: float = Field(
+        ..., description="版本目标浓度 (mg/L)"
+    )
+    measured_lower_mg_per_l: float = Field(
+        ..., description="请求给出的实测区间下界 (mg/L)"
+    )
+    measured_upper_mg_per_l: float = Field(
+        ..., description="请求给出的实测区间上界 (mg/L)"
+    )
+    final_lower_concentration: float = Field(
+        ...,
+        description="实测下界端点在追加补液并稀释到终体积后的浓度 (mg/L)",
+    )
+    final_upper_concentration: float = Field(
+        ...,
+        description="实测上界端点在追加补液并稀释到终体积后的浓度 (mg/L)",
+    )
+    worst_endpoint: str = Field(
+        ...,
+        description=(
+            "相对目标偏差绝对值更大的端点：lower=下界端点 / upper=上界端点"
+        ),
+    )
+    worst_relative_deviation: float = Field(
+        ...,
+        description=(
+            "最坏端点相对目标浓度的偏差（带符号分数，正为偏高、负为偏低）"
+        ),
+    )
+    status: str = Field(
+        ..., description="ok | under | over（按最坏端点与版本容差判定）"
+    )
+
+
+class TankCorrectionResult(BaseModel):
+    recipe_id: int
+    version: int
+    within_tolerance: bool = Field(
+        ...,
+        description=(
+            "最优补液方案下，所有元素实测区间端点在终体积的最大相对偏差"
+            "是否 ≤ 版本 tolerance；false 时仍返回最优补液量与超限项"
+        ),
+    )
+    optimal: bool = Field(
+        ..., description="minimax 求解器是否返回最优解（否则为可行近似）"
+    )
+    max_relative_deviation: float = Field(
+        ..., description="所有元素、两个区间端点中的最大相对偏差（分数）"
+    )
+    tolerance: float = Field(..., description="采用的版本容差（分数）")
+    current_volume_ml: float
+    target_final_volume_ml: float
+    final_volume_ml: float = Field(
+        ..., description="实际终体积 = 现有液量 + 浓缩液追加量 + 清水追加量"
+    )
+    added_total_ml: float = Field(
+        ..., description="补液总量 = 终体积 - 现有液量 (mL)"
+    )
+    water_add_ml: float = Field(
+        ..., description="建议追加的清水（不含矿物质）量 (mL)"
+    )
+    concentrate_total_ml: float = Field(
+        ..., description="各版本浓缩液建议追加量合计 (mL)"
+    )
+    additions: list[TankAdditionResult]
+    elements: list[TankCorrectionElementResult]
+    violations: list[Violation] = []
+    message: str = ""

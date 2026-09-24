@@ -1528,4 +1528,144 @@ with TestClient(app) as client:
         checked += 1
     print(f"52) procurement brute-force oracle matched on {checked} instances")
 
+    # ------------------------------------------------------------------ #
+    # 53) In-tank re-measurement correction
+    # (POST /api/recipes/{id}/versions/{v}/tank-correction)
+    # ------------------------------------------------------------------ #
+    r = client.post("/api/recipes", json={
+        "name": "在缸纠偏配方", "description": "", "note": "",
+        "request": base_request()})
+    assert r.status_code == 201, r.text
+    tc_rid = r.json()["recipe_id"]
+    tc_url = f"/api/recipes/{tc_rid}/versions/1/tank-correction"
+
+    def tc_body(**over):
+        body = {
+            "current_volume_ml": 9000,
+            "target_final_volume_ml": 10000,
+            "measurements": [
+                {"element": "N", "measured_lower_mg_per_l": 180,
+                 "measured_upper_mg_per_l": 180},
+                {"element": "P", "measured_lower_mg_per_l": 50,
+                 "measured_upper_mg_per_l": 50},
+                {"element": "K", "measured_lower_mg_per_l": 85,
+                 "measured_upper_mg_per_l": 85},
+            ],
+            "stock": [
+                {"concentrate": "A液", "stock_ml": 5000},
+                {"concentrate": "B液", "stock_ml": 5000},
+            ],
+        }
+        body.update(over)
+        return body
+
+    # 9 L already on target -> scale recipe additions linearly:
+    # A 150 + B 12.5 + water 837.5, zero deviation.
+    d = client.post(tc_url, json=tc_body()).json()
+    adds = {a["concentrate"]: a["add_volume_ml"] for a in d["additions"]}
+    assert d["within_tolerance"] is True and d["optimal"] is True, d
+    assert abs(adds["A液"] - 150) < 1e-4 and abs(adds["B液"] - 12.5) < 1e-4, adds
+    assert abs(d["water_add_ml"] - 837.5) < 1e-4
+    assert abs(d["final_volume_ml"] - 10000) < 1e-4
+    assert d["max_relative_deviation"] == 0.0
+    assert all(el["status"] == "ok" for el in d["elements"])
+
+    # Both interval endpoints must fit the band.
+    body = tc_body(measurements=[
+        {"element": "N", "measured_lower_mg_per_l": 168,
+         "measured_upper_mg_per_l": 172},
+        {"element": "P", "measured_lower_mg_per_l": 46,
+         "measured_upper_mg_per_l": 48},
+        {"element": "K", "measured_lower_mg_per_l": 79,
+         "measured_upper_mg_per_l": 81},
+    ])
+    d = client.post(tc_url, json=body).json()
+    assert d["within_tolerance"] is True, d
+    assert abs(d["max_relative_deviation"] - 0.018) < 1e-6, d
+    for el in d["elements"]:
+        # worst endpoint is the low one for all elements in this scenario
+        assert el["worst_endpoint"] == "lower", el
+        assert el["final_upper_concentration"] > el["final_lower_concentration"]
+
+    # Out-of-stock: 200 even with zero additions is still tolerated;
+    # push the low reading far enough to breach the band for sure.
+    body = tc_body(
+        measurements=[
+            {"element": "N", "measured_lower_mg_per_l": 100,
+             "measured_upper_mg_per_l": 100},
+            {"element": "P", "measured_lower_mg_per_l": 50,
+             "measured_upper_mg_per_l": 50},
+            {"element": "K", "measured_lower_mg_per_l": 85,
+             "measured_upper_mg_per_l": 85},
+        ],
+        stock=[
+            {"concentrate": "A液", "stock_ml": 0},
+            {"concentrate": "B液", "stock_ml": 0},
+        ],
+    )
+    r = client.post(tc_url, json=body)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["within_tolerance"] is False, d
+    # 9000 mL * 100 mg/L / 10000 mL = 90 mg/L -> -50%, nothing can be added
+    assert abs(d["elements"][0]["final_lower_concentration"] - 90) < 1e-6
+    assert abs(d["max_relative_deviation"] - 0.5) < 1e-6
+    nv = [v for v in d["violations"] if v["element"] == "N"]
+    assert nv and nv[0]["code"] == "ELEMENT_DEVIATION"
+    assert all(a["add_volume_ml"] == 0 for a in d["additions"])
+    assert abs(d["water_add_ml"] - 1000) < 1e-6
+
+    # Final volume == current volume: only zero additions feasible.
+    d = client.post(tc_url, json=tc_body(
+        current_volume_ml=10000, target_final_volume_ml=10000)).json()
+    assert d["added_total_ml"] == 0 and d["water_add_ml"] == 0
+
+    # Version must not be rewritten: still one version with original content.
+    assert [v["version"] for v in
+            client.get(f"/api/recipes/{tc_rid}/versions").json()] == [1]
+
+    # 422 matrix ----------------------------------------------------------- #
+    def tc_422(body):
+        r = client.post(tc_url, json=body)
+        assert r.status_code == 422, r.text
+        return r.json()["detail"]
+
+    detail = tc_422(tc_body(target_final_volume_ml=8000))
+    assert "不能小于" in str(detail)
+    detail = tc_422(tc_body(measurements=[
+        {"element": "N", "measured_lower_mg_per_l": 181,
+         "measured_upper_mg_per_l": 180},
+        {"element": "P", "measured_lower_mg_per_l": 50,
+         "measured_upper_mg_per_l": 50},
+        {"element": "K", "measured_lower_mg_per_l": 85,
+         "measured_upper_mg_per_l": 85}]))
+    assert "颠倒" in str(detail)
+    assert "缺少" in tc_422(tc_body(measurements=tc_body()["measurements"][:2]))["message"]
+    assert "未设目标" in tc_422(tc_body(measurements=tc_body()["measurements"] + [
+        {"element": "Ca", "measured_lower_mg_per_l": 1,
+         "measured_upper_mg_per_l": 2}]))["message"]
+    assert "未使用" in tc_422(tc_body(stock=[
+        {"concentrate": "A液", "stock_ml": 1},
+        {"concentrate": "C液", "stock_ml": 1}]))["message"]
+    assert "缺少" in tc_422(tc_body(stock=[
+        {"concentrate": "A液", "stock_ml": 1}]))["message"]
+    assert client.post(
+        "/api/recipes/999/versions/1/tank-correction", json=tc_body()
+    ).status_code == 404
+    assert client.post(
+        f"/api/recipes/{tc_rid}/versions/99/tank-correction", json=tc_body()
+    ).status_code == 404
+
+    # Zero-target version is not accepted for correction (422).
+    zreq = base_request()
+    zreq["targets"] = {"concentrations": {"N": 0, "P": 50, "K": 85}}
+    r = client.post("/api/recipes?force=true", json={
+        "name": "零目标纠偏配方", "request": zreq})
+    assert r.status_code == 201
+    z_rid = r.json()["recipe_id"]
+    r = client.post(f"/api/recipes/{z_rid}/versions/1/tank-correction",
+                    json=tc_body())
+    assert r.status_code == 422 and "目标浓度为零" in r.text
+    print("53) tank correction: linear scale / intervals / out-of-tol / 422 + 404 ok")
+
 print("\nALL SMOKE TESTS PASSED")
