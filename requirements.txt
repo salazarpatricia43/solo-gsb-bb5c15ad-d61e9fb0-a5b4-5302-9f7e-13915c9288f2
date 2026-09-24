@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+scipy==1.15.0
+numpy==2.2.1
+# IANA timezone database fallback for zoneinfo on slim images
+# (python:3.11-slim ships no /usr/share/zoneinfo).
+tzdata==2024.2

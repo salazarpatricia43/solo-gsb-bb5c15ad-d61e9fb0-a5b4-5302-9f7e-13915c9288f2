@@ -1,0 +1,18 @@
+services:
+  hydroponic-api:
+    build: .
+    image: hydroponic-solver:latest
+    container_name: hydroponic-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - hydroponic-data:/data
+    environment:
+      # SQLite 文件位置（容器内），默认即可
+      DATABASE_PATH: /data/hydroponic.db
+      # 试算时可接受的默认最大相对偏差
+      DEFAULT_TOLERANCE: "0.05"
+    restart: unless-stopped
+
+volumes:
+  hydroponic-data:
