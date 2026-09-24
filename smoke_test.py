@@ -1528,4 +1528,309 @@ with TestClient(app) as client:
         checked += 1
     print(f"52) procurement brute-force oracle matched on {checked} instances")
 
+    # =================================================================== #
+    # In-tank retest correction
+    # (POST /api/recipes/{id}/versions/{v}/retest-correction)
+    # =================================================================== #
+    # Single-concentrate version: target N=100 mg/L in 1000 mL; concentrate
+    # M carries N=50000 mg/L (50 mg per mL).
+    rt_recipe = {
+        "target_volume_ml": 1000,
+        "targets": {"concentrations": {"N": 100}},
+        "concentrates": [
+            {"name": "M", "available_volume": 100,
+             "concentrations": {"N": 50000, "Fe": 1000}},
+        ],
+        "max_concentrate_fraction": 0.5,
+        "min_water_ml": 0,
+        "tolerance": 0.05,
+    }
+    r = client.post("/api/recipes", json={
+        "name": "复测纠偏配方", "note": "retest", "request": rt_recipe})
+    assert r.status_code == 201, r.text
+    rt_rid = r.json()["recipe_id"]
+    rt_url = f"/api/recipes/{rt_rid}/versions/1/retest-correction"
+
+    def rt_body(**overrides) -> dict:
+        body = {
+            "current_volume_ml": 500,
+            "final_volume_ml": 1000,
+            "measurements": [
+                {"element": "n", "lower_mg_l": 80, "upper_mg_l": 82}],
+            "stock": [{"concentrate": "M", "stock_ml": 100}],
+        }
+        body.update(overrides)
+        return body
+
+    # 53) minimax balance: x* = 1.19 mL centres the interval on the target #
+    # Tank holds 40..41 mg N (80..82 mg/L x 500 mL); target at 1000 mL is
+    # 100 mg. Adding 59.5 mg (1.19 mL of M) centres the final interval at
+    # 99.5..100.5 mg/L -> worst endpoint deviation 0.5% <= tolerance 5%.
+    before = client.get(f"/api/recipes/{rt_rid}/versions/1").json()
+    r = client.post(rt_url, json=rt_body())
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["recipe_id"] == rt_rid and d["version"] == 1
+    assert d["within_tolerance"] is True and d["optimal"] is True
+    add = {a["concentrate"]: a for a in d["additions"]}
+    assert abs(add["M"]["volume_ml"] - 1.19) < 1e-4, add
+    assert add["M"]["stock_ml"] == 100.0
+    assert abs(d["water_to_add_ml"] - 498.81) < 1e-4
+    assert abs(d["concentrate_total_ml"] - 1.19) < 1e-4
+    # volume closure: current + concentrates + water == final
+    assert abs(d["current_volume_ml"] + d["concentrate_total_ml"]
+               + d["water_to_add_ml"] - d["final_volume_ml"]) < 1e-6
+    assert abs(d["max_relative_deviation"] - 0.005) < 1e-6
+    el = d["elements"][0]
+    assert el["element"] == "N" and el["status"] == "ok"
+    assert el["measured_lower_mg_l"] == 80.0
+    assert el["measured_upper_mg_l"] == 82.0
+    assert el["target_amount_mg"] == 100.0
+    assert abs(el["final_concentration_at_lower"] - 99.5) < 1e-3
+    assert abs(el["final_concentration_at_upper"] - 100.5) < 1e-3
+    # exact tie between endpoints -> deterministically reported as lower
+    assert el["worst_endpoint"] == "lower"
+    assert abs(el["relative_deviation"] - (-0.005)) < 1e-6
+    assert d["violations"] == []
+    assert d["tolerance"] == 0.05
+    # read-only: the saved version is byte-identical after the call
+    after = client.get(f"/api/recipes/{rt_rid}/versions/1").json()
+    assert before == after
+    print("53) retest minimax: 1.19 mL M + 498.81 mL water, dev -0.5%")
+
+    # 54) addable stock binds -> best plan still returned, worst endpoint - #
+    # Only 0.5 mL of M (25 mg) can be added: final 65..66 mg vs 100 mg.
+    d = client.post(rt_url, json=rt_body(
+        stock=[{"concentrate": "M", "stock_ml": 0.5}])).json()
+    assert d["within_tolerance"] is False and d["optimal"] is True
+    assert d["additions"][0]["volume_ml"] == 0.5
+    assert abs(d["water_to_add_ml"] - 499.5) < 1e-6
+    el = d["elements"][0]
+    assert el["worst_endpoint"] == "lower" and el["status"] == "under"
+    assert abs(el["relative_deviation"] - (-0.35)) < 1e-6
+    assert abs(d["max_relative_deviation"] - 0.35) < 1e-6
+    v = d["violations"]
+    assert len(v) == 1 and v[0]["code"] == "ELEMENT_DEVIATION"
+    assert v[0]["element"] == "N" and "下界" in v[0]["message"]
+    assert abs(v[0]["actual"] - 65.0) < 1e-6
+    assert abs(v[0]["limit"] - 95.0) < 1e-6  # 100 * (1 - 5%)
+    print("54) stock-capped retest returns best plan + worst endpoint")
+
+    # 55) already over target -> pure water dilution, worst endpoint upper #
+    # 210..220 mg/L in 500 mL = 105..110 mg; any M makes it worse, so the
+    # optimum adds only water: final 105..110 mg/L, worst +10% at the upper
+    # endpoint (beyond the 5% tolerance).
+    d = client.post(rt_url, json=rt_body(measurements=[
+        {"element": "N", "lower_mg_l": 210, "upper_mg_l": 220}])).json()
+    assert d["within_tolerance"] is False
+    assert d["additions"][0]["volume_ml"] == 0.0
+    assert d["water_to_add_ml"] == 500.0
+    el = d["elements"][0]
+    assert el["worst_endpoint"] == "upper" and el["status"] == "over"
+    assert abs(el["relative_deviation"] - 0.10) < 1e-6
+    assert abs(el["final_concentration_at_upper"] - 110.0) < 1e-6
+    assert d["violations"][0]["element"] == "N"
+    assert "上界" in d["violations"][0]["message"]
+    print("55) over-target tank: water-only optimum, worst=upper endpoint")
+
+    # 56) multi-element version: minimax bounded by interval widths ------ #
+    # Measured intervals have intrinsic width, so t=0 is impossible: P's
+    # interval spans 192..200 mg around target 500 mg -> t >= 0.008. The
+    # optimum centres P exactly (B 76 mL = 304 mg, unique) and keeps N/K
+    # within +-0.8% as well.
+    r = client.post("/api/recipes", json={
+        "name": "复测多元素", "request": base_request()})
+    assert r.status_code == 201
+    ab_rid = r.json()["recipe_id"]
+    ab_url = f"/api/recipes/{ab_rid}/versions/1/retest-correction"
+    d = client.post(ab_url, json={
+        "current_volume_ml": 4000,
+        "final_volume_ml": 10000,
+        "measurements": [
+            {"element": "N", "lower_mg_l": 170, "upper_mg_l": 175},
+            {"element": "P", "lower_mg_l": 48, "upper_mg_l": 50},
+            {"element": "K", "lower_mg_l": 80, "upper_mg_l": 83},
+        ],
+        "stock": [
+            {"concentrate": "A液", "stock_ml": 2000},
+            {"concentrate": "B液", "stock_ml": 2000},
+        ],
+    }).json()
+    assert d["within_tolerance"] is True, d
+    assert abs(d["max_relative_deviation"] - 0.008) < 1e-6, d
+    assert all(e["status"] == "ok" for e in d["elements"])
+    adds = {a["concentrate"]: a["volume_ml"] for a in d["additions"]}
+    # P must be centred: added 304 mg -> B exactly 76 mL (4 mg/mL)
+    assert abs(adds["B液"] - 76.0) < 1e-4, adds
+    # N band at t=0.008: added in [1085.6, 1134.4] mg -> A in [904.7, 945.3]
+    assert 904.0 <= adds["A液"] <= 946.0, adds
+    elems = {e["element"]: e for e in d["elements"]}
+    # P endpoints tie at +-0.008 -> deterministic lower-endpoint report
+    assert elems["P"]["worst_endpoint"] == "lower"
+    assert abs(elems["P"]["relative_deviation"] - (-0.008)) < 1e-6
+    assert abs(d["current_volume_ml"] + d["concentrate_total_ml"]
+               + d["water_to_add_ml"] - 10000) < 1e-6
+    print("56) multi-element retest: minimax 0.8% (P interval width)")
+
+    # 56b) brute-force oracle: fine grid search matches the LP minimax ---- #
+    def brute_retest() -> float:
+        """Independent oracle: exhaustive 1 mL grid over (x_A, x_B)."""
+        V0 = 4000.0
+        lo = {"N": 170 * V0 / 1000, "P": 48 * V0 / 1000, "K": 80 * V0 / 1000}
+        hi = {"N": 175 * V0 / 1000, "P": 50 * V0 / 1000, "K": 83 * V0 / 1000}
+        T = {"N": 1800.0, "P": 500.0, "K": 850.0}
+        best = None
+        for xa in range(880, 961):
+            for xb in range(60, 91):
+                if xa + xb > 6000:
+                    continue
+                t = 0.0
+                for e in ("N", "P", "K"):
+                    a = {"N": 1.2 * xa, "P": 4.0 * xb,
+                         "K": 0.4 * xa + 2.0 * xb}[e]
+                    t = max(t,
+                            abs(lo[e] + a - T[e]) / T[e],
+                            abs(hi[e] + a - T[e]) / T[e])
+                if best is None or t < best:
+                    best = t
+        return best
+
+    t_grid = brute_retest()
+    assert abs(d["max_relative_deviation"] - t_grid) < 1e-9, (
+        d["max_relative_deviation"], t_grid)
+    print("56b) retest LP matches brute-force grid oracle:", t_grid)
+
+    # 57) retest 404/422 matrix ------------------------------------------ #
+    assert client.post("/api/recipes/999/versions/1/retest-correction",
+                       json=rt_body()).status_code == 404
+    assert client.post(
+        f"/api/recipes/{rt_rid}/versions/99/retest-correction",
+        json=rt_body()).status_code == 404
+
+    def rt_422(body, label):
+        rr = client.post(rt_url, json=body)
+        assert rr.status_code == 422, (label, rr.status_code, rr.text[:300])
+        return rr
+
+    rr = rt_422(rt_body(final_volume_ml=400), "final < current")
+    assert "不能小于现有液量" in rr.text
+    rr = rt_422(rt_body(measurements=[
+        {"element": "N", "lower_mg_l": 90, "upper_mg_l": 80}]),
+        "inverted interval")
+    assert "颠倒" in rr.text
+    rr = rt_422(rt_body(stock=[{"concentrate": "X", "stock_ml": 1}]),
+                "unknown stock name")
+    assert "未使用" in rr.json()["detail"]["message"]
+    rt_422(rt_body(stock=[]), "empty stock")
+    rt_422(rt_body(stock=[{"concentrate": "M", "stock_ml": 1},
+                          {"concentrate": "M", "stock_ml": 2}]),
+           "duplicate stock")
+    rt_422(rt_body(stock=[{"concentrate": "M", "stock_ml": -1}]),
+           "negative stock")
+    rr = rt_422(rt_body(measurements=[
+        {"element": "N", "lower_mg_l": 80, "upper_mg_l": 82},
+        {"element": "P", "lower_mg_l": 1, "upper_mg_l": 2}]),
+        "measurement beyond targets")
+    assert "目标之外" in rr.json()["detail"]["message"]
+    rt_422(rt_body(measurements=[
+        {"element": "N", "lower_mg_l": 80, "upper_mg_l": 82},
+        {"element": "n", "lower_mg_l": 1, "upper_mg_l": 2}]),
+        "duplicate element (case-insensitive)")
+    rt_422(rt_body(measurements=[]), "empty measurements")
+    rt_422(rt_body(measurements=[
+        {"element": "Xx", "lower_mg_l": 1, "upper_mg_l": 2}]),
+        "unknown element symbol")
+    rt_422(rt_body(current_volume_ml=0), "zero current volume")
+    rt_422(rt_body(final_volume_ml=0), "zero final volume")
+    bad = rt_body()
+    bad["bogus"] = 1
+    rt_422(bad, "extra top-level field")
+    bad = rt_body()
+    bad["measurements"][0]["bogus"] = 1
+    rt_422(bad, "extra measurement field")
+    # missing target element K on the 3-element version
+    rr = client.post(ab_url, json={
+        "current_volume_ml": 4000, "final_volume_ml": 10000,
+        "measurements": [
+            {"element": "N", "lower_mg_l": 170, "upper_mg_l": 175},
+            {"element": "P", "lower_mg_l": 48, "upper_mg_l": 50}],
+        "stock": [{"concentrate": "A液", "stock_ml": 2000},
+                  {"concentrate": "B液", "stock_ml": 2000}]})
+    assert rr.status_code == 422
+    assert "缺少" in rr.json()["detail"]["message"]
+    # missing stock for one concentrate on the 2-liquid version
+    rr = client.post(ab_url, json={
+        "current_volume_ml": 4000, "final_volume_ml": 10000,
+        "measurements": [
+            {"element": "N", "lower_mg_l": 170, "upper_mg_l": 175},
+            {"element": "P", "lower_mg_l": 48, "upper_mg_l": 50},
+            {"element": "K", "lower_mg_l": 80, "upper_mg_l": 83}],
+        "stock": [{"concentrate": "A液", "stock_ml": 2000}]})
+    assert rr.status_code == 422
+    assert "缺少" in rr.json()["detail"]["message"]
+    # NaN / Infinity tokens (non-standard JSON) must be rejected, not 500
+    for token in ("NaN", "Infinity"):
+        rr = client.post(
+            rt_url,
+            content=(
+                '{"current_volume_ml": 500, "final_volume_ml": 1000,'
+                ' "measurements": [{"element": "N", "lower_mg_l": '
+                + token + ', "upper_mg_l": 82}],'
+                ' "stock": [{"concentrate": "M", "stock_ml": 100}]}'
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        assert rr.status_code == 422, (token, rr.status_code, rr.text[:200])
+    for token in ("NaN", "Infinity"):
+        rr = client.post(
+            rt_url,
+            content=(
+                '{"current_volume_ml": 500, "final_volume_ml": 1000,'
+                ' "measurements": [{"element": "N", "lower_mg_l": 80,'
+                ' "upper_mg_l": 82}],'
+                ' "stock": [{"concentrate": "M", "stock_ml": '
+                + token + '}]}'
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        assert rr.status_code == 422, ("stock", token, rr.status_code)
+    print("57) retest 404/422 matrix ok")
+
+    # 58) zero-target version rejected ----------------------------------- #
+    zt = {
+        "target_volume_ml": 1000,
+        "targets": {"concentrations": {"N": 100, "B": 0}},
+        "concentrates": [
+            {"name": "M", "available_volume": 100,
+             "concentrations": {"N": 50000, "B": 500}}],
+        "max_concentrate_fraction": 0.5,
+        "min_water_ml": 0,
+        "tolerance": 0.05,
+    }
+    r = client.post("/api/recipes", json={"name": "零目标配方", "request": zt})
+    assert r.status_code == 201, r.text
+    z_rid = r.json()["recipe_id"]
+    rr = client.post(
+        f"/api/recipes/{z_rid}/versions/1/retest-correction",
+        json={
+            "current_volume_ml": 500, "final_volume_ml": 1000,
+            "measurements": [
+                {"element": "N", "lower_mg_l": 80, "upper_mg_l": 82},
+                {"element": "B", "lower_mg_l": 0, "upper_mg_l": 0}],
+            "stock": [{"concentrate": "M", "stock_ml": 100}]})
+    assert rr.status_code == 422
+    assert "为零" in rr.json()["detail"]["message"]
+    print("58) zero-target version rejected with 422")
+
+    # 59) final == current: nothing can be added, state reported as-is ---- #
+    d = client.post(rt_url, json=rt_body(final_volume_ml=500)).json()
+    assert d["additions"][0]["volume_ml"] == 0.0
+    assert d["water_to_add_ml"] == 0.0
+    # 80..82 mg/L vs target 100 -> worst -20% at the lower endpoint
+    el = d["elements"][0]
+    assert el["worst_endpoint"] == "lower" and el["status"] == "under"
+    assert abs(el["relative_deviation"] - (-0.20)) < 1e-6
+    assert d["within_tolerance"] is False
+    print("59) final == current volume: zero-add plan evaluated as-is")
+
 print("\nALL SMOKE TESTS PASSED")

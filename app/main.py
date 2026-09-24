@@ -27,12 +27,15 @@ from .models import (
     ProcurementPlanResult,
     RecipeSummary,
     RecipeVersion,
+    RetestCorrectionRequest,
+    RetestCorrectionResult,
     SaveRecipeRequest,
     SolveRequest,
     SolveResult,
     VersionSummary,
 )
 from .procurement import ProcurementError, build_procurement_plan
+from .retest import RetestError, build_retest_correction
 from .solver import solve
 
 
@@ -382,6 +385,61 @@ def dispense_plan(
     except DispenseError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
     return DispensePlanResult(**plan)
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/retest-correction",
+    response_model=RetestCorrectionResult,
+    tags=["recipes"],
+    summary="在缸复测纠偏：按实测浓度区间求最优补液量（只读，不改写版本）",
+)
+def retest_correction(
+    recipe_id: int, version: int, req: RetestCorrectionRequest
+) -> RetestCorrectionResult:
+    """读取版本目标浓度/容差/浓缩液成分，按实测区间求 minimax 补液量。
+
+    - 缸内现有 ``current_volume_ml`` mL 工作液，各目标元素实测浓度落在
+      ``measurements`` 给出的 [下界, 上界] (mg/L) 区间内；只允许追加
+      **版本内浓缩液**（受 ``stock`` 可追加库存约束）与**清水**，把液量
+      补齐到 ``final_volume_ml``（物料守恒：现有液量 + Σ补液量 + 清水
+      = 目标终体积；清水只占体积、不携带元素）。
+    - 元素在缸中的实际量只知道落在实测区间内，而相对偏差关于该量是
+      线性的、最坏情况必在端点取得；minimax LP（HiGHS）最小化所有
+      实测区间**端点**在终体积下的最大相对目标偏差。LP 恒可行，故
+      总是返回最优补液量。
+    - 超出版本容差时仍返回最优补液量（``within_tolerance=false``），
+      逐元素给出最坏端点（``worst_endpoint: lower/upper``）、终体积下
+      两端点浓度与带符号偏差，超限项列入 ``violations``。
+    - 接口**只读**：读取但不改写配方版本。
+    - 配方/版本不存在返回 404；目标终体积小于现有液量、实测区间颠倒、
+      实测元素与版本目标不符（缺少/多余/重复）、库存名称不符（未知/
+      缺少/重复/为负/非有限）、版本含零目标浓度元素、体积或浓度非正/
+      非有限、多余字段均返回 422。
+    """
+    recipe = database.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(404, "配方不存在")
+    row = database.get_version(recipe_id, version)
+    if row is None:
+        raise HTTPException(404, "该版本不存在")
+
+    request_payload = json.loads(row["request_json"])
+    try:
+        result = build_retest_correction(
+            recipe_id=recipe_id,
+            version=version,
+            request_payload=request_payload,
+            current_volume_ml=req.current_volume_ml,
+            final_volume_ml=req.final_volume_ml,
+            measurements=[
+                (m.element, m.lower_mg_l, m.upper_mg_l)
+                for m in req.measurements
+            ],
+            stock={s.concentrate: s.stock_ml for s in req.stock},
+        )
+    except RetestError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return RetestCorrectionResult(**result)
 
 
 @app.get(
